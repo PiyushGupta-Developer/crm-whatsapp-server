@@ -177,10 +177,23 @@ app.post(
 );
 
 
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Server running at http://localhost:${PORT}`);
+// app.listen(PORT, "127.0.0.1", () => {
+//   console.log(`Server running at http://localhost:${PORT}`);
 
-  // Verify MySQL connection and package expiry date
+//   // Verify MySQL connection and package expiry date
+//   testDatabaseConnection().catch((error) => {
+//     console.error("[MySQL] Connection check failed:", error.message);
+//   });
+
+//   // Start existing schedulers
+//   startReminderScheduler();
+//   startStockReminderScheduler();
+// });
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+
+  // Verify MySQL connection
   testDatabaseConnection().catch((error) => {
     console.error("[MySQL] Connection check failed:", error.message);
   });
