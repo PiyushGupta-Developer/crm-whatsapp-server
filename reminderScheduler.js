@@ -330,6 +330,10 @@ function startReminderScheduler() {
 
   console.log("[Reminder Scheduler] Invoice and Lead reminders started.");
 console.log("[Package Expiry Scheduler] Started.");
+console.log("[Client Package Expiry Scheduler] Started.");
+console.log(
+  "[Reminder Scheduler] Checking immediately, then every 10 seconds.",
+);
 
   processDueReminders();
   processDueLeadReminders();
