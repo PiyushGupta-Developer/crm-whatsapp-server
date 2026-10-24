@@ -334,11 +334,12 @@ console.log("[Package Expiry Scheduler] Started.");
   processDueReminders();
   processDueLeadReminders();
 processPackageExpiryReminders();
-
+processClientPackageExpiryReminders();
   setInterval(() => {
     processDueReminders();
     processDueLeadReminders();
   processPackageExpiryReminders();
+  processClientPackageExpiryReminders();
   }, 10000);
 }
 
@@ -671,11 +672,248 @@ async function processPackageExpiryReminders() {
     packageExpirySchedulerBusy = false;
   }
 }
+let clientPackageExpirySchedulerBusy = false;
 
+async function processClientPackageExpiryReminders() {
+  if (clientPackageExpirySchedulerBusy) return;
+
+  clientPackageExpirySchedulerBusy = true;
+
+  try {
+    const [packages] = await pool.query(`
+      SELECT
+        csp.id,
+        csp.client_id,
+        csp.package_id,
+        DATE_FORMAT(csp.service_end_date, '%Y-%m-%d') AS expiry_date,
+        cs.organization_id,
+        cs.contact,
+        CASE
+          WHEN DATE(csp.service_end_date) = CURDATE()
+            THEN 'expiry_day'
+          ELSE 'before_20_days'
+        END AS reminder_stage
+      FROM client_service_packages csp
+      INNER JOIN client_services cs
+        ON cs.client_id = csp.client_id
+      WHERE csp.status = 'Active'
+        AND csp.payment_status = 'Paid'
+        AND csp.service_end_date IS NOT NULL
+        AND DATE(csp.service_end_date) IN (
+          CURDATE(),
+          DATE_ADD(CURDATE(), INTERVAL 20 DAY)
+        )
+      ORDER BY csp.id ASC
+    `);
+
+    for (const pkg of packages) {
+      try {
+        const stage = pkg.reminder_stage;
+        const expiryDate = pkg.expiry_date;
+
+        if (!pkg.organization_id || !expiryDate) continue;
+
+        const message =
+          stage === "expiry_day"
+            ? `Client Package Expiry Reminder\n\nYour client package expires today (${expiryDate}). Please renew your package to continue using the service.`
+            : `Client Package Expiry Reminder\n\nYour client package will expire on ${expiryDate}, which is 20 days from today. Please plan your renewal.`;
+
+        // Active Admins of this organization
+        const [admins] = await pool.query(
+          `SELECT id, customer_id
+           FROM users
+           WHERE organization_id = ?
+             AND role = 'admin'
+             AND status = 1`,
+          [pkg.organization_id],
+        );
+
+        // Active Super Admins
+        const [superAdmins] = await pool.query(
+          `SELECT id
+           FROM users
+           WHERE role = 'super_admin'
+             AND status = 1`,
+        );
+
+        const recipients = [
+          ...admins.map((user) => ({
+            type: "admin",
+            id: user.id,
+          })),
+          ...superAdmins.map((user) => ({
+            type: "super_admin",
+            id: user.id,
+          })),
+        ];
+
+        // Dashboard notifications
+        for (const recipient of recipients) {
+          try {
+            const [existing] = await pool.query(
+              `SELECT id
+               FROM client_package_expiry_reminders
+               WHERE client_service_package_id = ?
+                 AND reminder_stage = ?
+                 AND recipient_type = ?
+                 AND recipient_id = ?
+                 AND channel = 'dashboard'
+               LIMIT 1`,
+              [pkg.id, stage, recipient.type, recipient.id],
+            );
+
+            if (existing.length) continue;
+
+            await pool.query(
+              `INSERT INTO notifications
+               (user_type, user_id, organization_id, title,
+                message, notification_type, action_url, is_read)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0)`,
+              [
+                recipient.type,
+                recipient.id,
+                pkg.organization_id,
+                "Client Package Expiry Reminder",
+                message,
+                "client_package_expiry",
+                "admin-client-packages",
+              ],
+            );
+
+            await pool.query(
+              `INSERT INTO client_package_expiry_reminders
+               (client_service_package_id, client_id, organization_id,
+                recipient_type, recipient_id, channel,
+                reminder_stage, status, sent_at)
+               VALUES (?, ?, ?, ?, ?, 'dashboard', ?, 'sent', NOW())`,
+              [
+                pkg.id,
+                pkg.client_id,
+                pkg.organization_id,
+                recipient.type,
+                recipient.id,
+                stage,
+              ],
+            );
+          } catch (error) {
+            console.error(
+              "[Client Package Expiry] Dashboard notification failed:",
+              error.message,
+            );
+          }
+        }
+
+        // WhatsApp reminder to the organization's registered contact
+        const phone = String(pkg.contact || "").replace(/\D/g, "");
+
+        if (phone.length >= 10) {
+          const [existing] = await pool.query(
+            `SELECT id
+             FROM client_package_expiry_reminders
+             WHERE client_service_package_id = ?
+               AND reminder_stage = ?
+               AND recipient_type = 'admin'
+               AND recipient_id = ?
+               AND channel = 'whatsapp'
+             LIMIT 1`,
+            [pkg.id, admins[0]?.id || 0],
+          );
+
+          if (admins.length && !existing.length) {
+            const [devices] = await pool.query(
+              `SELECT id
+               FROM whatsapp_devices
+               WHERE organization_id = ?
+               ORDER BY id ASC`,
+              [pkg.organization_id],
+            );
+
+            let connectedDeviceId = null;
+
+            for (const device of devices) {
+              const status = getWhatsAppStatus(
+                String(pkg.organization_id),
+                String(device.id),
+              );
+
+              if (status.status === "connected") {
+                connectedDeviceId = String(device.id);
+                break;
+              }
+            }
+
+            if (connectedDeviceId) {
+              const admin = admins[0];
+
+              await pool.query(
+                `INSERT INTO client_package_expiry_reminders
+                 (client_service_package_id, client_id, organization_id,
+                  recipient_type, recipient_id, channel,
+                  reminder_stage, status)
+                 VALUES (?, ?, ?, 'admin', ?, 'whatsapp', ?, 'sending')`,
+                [pkg.id, pkg.client_id, pkg.organization_id, admin.id, stage],
+              );
+
+              try {
+                const result = await sendWhatsAppMessage(
+                  String(pkg.organization_id),
+                  connectedDeviceId,
+                  phone,
+                  message,
+                );
+
+                if (!result || result.success !== true) {
+                  throw new Error("WhatsApp sending was not confirmed");
+                }
+
+                await pool.query(
+                  `UPDATE client_package_expiry_reminders
+                   SET status = 'sent', sent_at = NOW(), last_error = NULL
+                   WHERE client_service_package_id = ?
+                     AND reminder_stage = ?
+                     AND recipient_type = 'admin'
+                     AND recipient_id = ?
+                     AND channel = 'whatsapp'`,
+                  [pkg.id, stage, admin.id],
+                );
+              } catch (error) {
+                await pool.query(
+                  `UPDATE client_package_expiry_reminders
+                   SET status = 'failed', last_error = ?
+                   WHERE client_service_package_id = ?
+                     AND reminder_stage = ?
+                     AND recipient_type = 'admin'
+                     AND recipient_id = ?
+                     AND channel = 'whatsapp'`,
+                  [
+                    String(error.message).slice(0, 2000),
+                    pkg.id,
+                    stage,
+                    admin.id,
+                  ],
+                );
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.error(
+          `[Client Package Expiry] Package #${pkg.id} failed:`,
+          error.message,
+        );
+      }
+    }
+  } catch (error) {
+    console.error("[Client Package Expiry Scheduler] Error:", error.message);
+  } finally {
+    clientPackageExpirySchedulerBusy = false;
+  }
+}
 
 module.exports = {
   startReminderScheduler,
   processDueReminders,
   processDueLeadReminders,
   processPackageExpiryReminders,
+  processClientPackageExpiryReminders,
 };
