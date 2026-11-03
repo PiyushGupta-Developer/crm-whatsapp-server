@@ -339,11 +339,14 @@ console.log(
   processDueLeadReminders();
 processPackageExpiryReminders();
 processClientPackageExpiryReminders();
+processQuotationExpiryReminders();
+
   setInterval(() => {
     processDueReminders();
     processDueLeadReminders();
   processPackageExpiryReminders();
   processClientPackageExpiryReminders();
+      processQuotationExpiryReminders();
   }, 10000);
 }
 
@@ -913,11 +916,202 @@ async function processClientPackageExpiryReminders() {
     clientPackageExpirySchedulerBusy = false;
   }
 }
+let quotationReminderBusy = false;
 
+async function processQuotationExpiryReminders() {
+  if (quotationReminderBusy) return;
+
+  quotationReminderBusy = true;
+
+  try {
+    // 1. Aaj expire hone wali latest quotations fetch karo.
+    const [quotations] = await pool.query(`
+            SELECT
+                q.id,
+                q.organization_id,
+                q.quotation_no,
+                q.customer_name,
+                DATE_FORMAT(q.expired_on, '%Y-%m-%d') AS expiry_date,
+                q.grand_total,
+                c.phone AS phone_number
+            FROM quotations q
+
+            LEFT JOIN customers c
+                ON c.id = (
+                    SELECT MIN(c2.id)
+                    FROM customers c2
+                    WHERE c2.customer_name = q.customer_name
+                    AND c2.organization_id = q.organization_id
+                )
+
+            WHERE q.expired_on = CURDATE()
+              AND q.is_latest = 1
+              AND q.organization_id IS NOT NULL
+
+            ORDER BY q.id ASC
+            LIMIT 50
+        `);
+
+    console.log(
+      "[Quotation Reminder] Today's expired quotations:",
+      quotations.length,
+    );
+
+    for (const quotation of quotations) {
+      try {
+        const phone = String(quotation.phone_number || "").replace(/\D/g, "");
+
+        if (phone.length < 10) {
+          console.log(
+            `[Quotation Reminder] Invalid phone for quotation #${quotation.id}`,
+          );
+          continue;
+        }
+
+        // 2. Duplicate reminder record insert karo.
+        await pool.query(
+          `INSERT IGNORE INTO quotation_whatsapp_reminders
+                    (
+                        quotation_id,
+                        organization_id,
+                        phone_number,
+                        reminder_date,
+                        status
+                    )
+                    VALUES (?, ?, ?, CURDATE(), 'pending')`,
+          [quotation.id, quotation.organization_id, phone],
+        );
+
+        // 3. Pending ya failed reminder ko claim karo.
+        const [claim] = await pool.query(
+          `UPDATE quotation_whatsapp_reminders
+                     SET status = 'sending',
+                         phone_number = ?,
+                         attempts = attempts + 1,
+                         last_error = NULL
+                     WHERE quotation_id = ?
+                       AND reminder_date = CURDATE()
+                       AND (
+    status = 'pending'
+    OR (
+        status = 'failed'
+        AND updated_at <= DATE_SUB(NOW(), INTERVAL 15 MINUTE)
+    )
+)`,
+          [phone, quotation.id],
+        );
+
+        if (claim.affectedRows !== 1) {
+          console.log(
+            `[Quotation Reminder] Already processed: #${quotation.id}`,
+          );
+          continue;
+        }
+
+        // 4. Organization ka WhatsApp device fetch karo.
+        const [devices] = await pool.query(
+          `SELECT id
+                     FROM whatsapp_devices
+                     WHERE organization_id = ?
+                     ORDER BY id ASC`,
+          [quotation.organization_id],
+        );
+
+        let connectedDeviceId = null;
+
+        for (const device of devices) {
+          const deviceStatus = getWhatsAppStatus(
+            String(quotation.organization_id),
+            String(device.id),
+          );
+
+          if (deviceStatus.status === "connected") {
+            connectedDeviceId = String(device.id);
+            break;
+          }
+        }
+
+        if (!connectedDeviceId) {
+          throw new Error(
+            "No connected WhatsApp device found for this organization",
+          );
+        }
+
+      const expiryDate = new Date(`${quotation.expiry_date}T00:00:00+05:30`);
+
+        const formattedDate = expiryDate.toLocaleDateString("en-IN", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+          timeZone: "Asia/Kolkata",
+        });
+
+        const message =
+          `Quotation Expiry Reminder\n\n` +
+          `Dear ${quotation.customer_name || "Customer"},\n\n` +
+          `Your quotation is expiring today.\n\n` +
+          `Quotation No: ${quotation.quotation_no}\n` +
+          `Expiry Date: ${formattedDate}\n` +
+          `Amount: Rs. ${quotation.grand_total || 0}\n\n` +
+          `Please contact us for further details.\n\n` +
+          `Thank you.`;
+
+        // 6. Customer ko WhatsApp message bhejo.
+        const result = await sendWhatsAppMessage(
+          String(quotation.organization_id),
+          connectedDeviceId,
+          phone,
+          message,
+        );
+
+        if (!result || result.success !== true) {
+          throw new Error("WhatsApp message sending was not confirmed");
+        }
+
+        // 7. Successfully sent status save karo.
+        await pool.query(
+          `UPDATE quotation_whatsapp_reminders
+                     SET status = 'sent',
+                         sent_at = NOW(),
+                         last_error = NULL
+                     WHERE quotation_id = ?
+                       AND reminder_date = CURDATE()
+                       AND status = 'sending'`,
+          [quotation.id],
+        );
+
+        console.log(
+          `[Quotation Reminder] Sent successfully for quotation #${quotation.id}`,
+        );
+      } catch (error) {
+        console.error(
+          `[Quotation Reminder] Failed for quotation #${quotation.id}:`,
+          error.message,
+        );
+
+        // 8. Failed status save karo.
+        await pool.query(
+          `UPDATE quotation_whatsapp_reminders
+                     SET status = 'failed',
+                         last_error = ?
+                     WHERE quotation_id = ?
+                       AND reminder_date = CURDATE()
+                       AND status = 'sending'`,
+          [String(error.message).slice(0, 2000), quotation.id],
+        );
+      }
+    }
+  } catch (error) {
+    console.error("[Quotation Reminder] Scheduler error:", error.message);
+  } finally {
+    quotationReminderBusy = false;
+  }
+}
 module.exports = {
   startReminderScheduler,
   processDueReminders,
   processDueLeadReminders,
   processPackageExpiryReminders,
   processClientPackageExpiryReminders,
+  processQuotationExpiryReminders,
 };
